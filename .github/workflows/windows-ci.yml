@@ -1,0 +1,147 @@
+name: Windows Rust CI
+
+on:
+  push:
+    branches: [turboview, "perf/**", "next/**"]
+  pull_request:
+    branches: [turboview]
+    paths:
+      - "turboview/**"
+      - ".github/workflows/windows-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: turboview
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Add vendored NASM to PATH
+        shell: pwsh
+        run: |
+          "$env:GITHUB_WORKSPACE\turboview\third-party\nasm\nasm-2.16.03" >> $env:GITHUB_PATH
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: turboview
+
+      - name: Configure libjpeg-turbo
+        working-directory: .
+        run: >
+          cmake -G Ninja -S . -B build-turbo
+          -DCMAKE_BUILD_TYPE=Release
+          -DWITH_SIMD=ON
+          -DWITH_TURBOJPEG=ON
+          -DENABLE_SHARED=OFF
+          -DENABLE_STATIC=ON
+          -DWITH_CRT_DLL=OFF
+          -DWITH_JAVA=OFF
+          -DWITH_FUZZ=OFF
+          -DWITH_TOOLS=OFF
+          -DWITH_TESTS=OFF
+
+      - name: Build libjpeg-turbo static library
+        working-directory: .
+        run: cmake --build build-turbo --config Release --target turbojpeg-static --parallel 4
+
+      - name: Compile experimental WIC decoder
+        run: cargo check --features wic-decode --locked
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Build release application
+        run: cargo build --release --locked
+
+      - name: Assemble portable package
+        shell: pwsh
+        working-directory: .
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path $env:RUNNER_TEMP "TurboView-portable"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $exe = Join-Path $env:GITHUB_WORKSPACE "turboview\target\release\turboview.exe"
+          if (!(Test-Path $exe)) { throw "Release executable not found: $exe" }
+          Copy-Item $exe $dist
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "turboview\README.md") (Join-Path $dist "README.md")
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "LICENSE.md") (Join-Path $dist "LIBJPEG-TURBO-LICENSE.md")
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "README.ijg") (Join-Path $dist "README.ijg")
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "turboview\CHANGELOG.md") $dist
+          $manifest = Join-Path $env:GITHUB_WORKSPACE "turboview\Cargo.toml"
+          $version = (Select-String -Path $manifest -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if (!$version) { throw "Unable to read version from Cargo.toml" }
+          @"
+          TurboView $version - Windows x64 Portable
+          ======================================
+
+          Version: $version
+          Commit: $env:GITHUB_SHA
+
+          Run turboview.exe directly. No Rust or Cargo installation is required.
+          Keep the executable, README.md, CHANGELOG.md and license notices together.
+
+          This package is built from the exact Git commit associated with this workflow run.
+          Windows system graphics components are provided by Windows. The C/C++ runtime
+          is statically linked; no separate Visual C++ Redistributable or ICU installation is required.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $dist "PORTABLE-README.txt")
+          $zip = Join-Path $env:RUNNER_TEMP "TurboView-Windows-x64-portable.zip"
+          Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip -Force
+
+          # Smoke-check the actual archive, not just the staging directory.
+          $verify = Join-Path $env:RUNNER_TEMP "TurboView-portable-verify"
+          Expand-Archive -LiteralPath $zip -DestinationPath $verify -Force
+          $required = @(
+            "turboview.exe",
+            "README.md",
+            "CHANGELOG.md",
+            "LIBJPEG-TURBO-LICENSE.md",
+            "README.ijg",
+            "PORTABLE-README.txt"
+          )
+          foreach ($name in $required) {
+            if (!(Test-Path (Join-Path $verify $name))) {
+              throw "Portable ZIP is missing required file: $name"
+            }
+          }
+          if ((Get-Item (Join-Path $verify "turboview.exe")).Length -lt 1MB) {
+            throw "Portable executable is unexpectedly small."
+          }
+          # Verify the executable does not depend on optional VC++ or ICU DLLs.
+          $imports = (& dumpbin.exe /nologo /dependents (Join-Path $verify "turboview.exe") 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin dependency inspection failed: $imports" }
+          $forbiddenRuntime = '(?i)\b(?:icuuc|icuin|icudt\d*|msvcp140(?:_\d+)?|vcruntime140(?:_1)?|concrt140)\.dll\b'
+          if ($imports -match $forbiddenRuntime) {
+            throw "Portable executable still imports an optional ICU or VC++ runtime DLL.`n$imports"
+          }
+          if ((Get-Item $zip).Length -lt 1MB) {
+            throw "Portable ZIP is unexpectedly small."
+          }
+          "PORTABLE_ZIP=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: Upload portable Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurboView-Windows-x64-portable
+          path: ${{ runner.temp }}/TurboView-Windows-x64-portable.zip
+          if-no-files-found: error
+          retention-days: 30
